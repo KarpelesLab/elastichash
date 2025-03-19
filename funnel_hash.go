@@ -6,17 +6,18 @@ import (
 )
 
 type FunnelHashTable struct {
-	levels    []Level            // slice of levels 0..B-1
-	special   []int              // special overflow array
-	b         int                // bucket size (slots per bucket)
+	levels    []Level   // slice of levels 0..B-1
+	special   []int     // special overflow array
+	b         int       // bucket size (slots per bucket)
 	size      int
 	capacity  int
 }
 
 // Each level has an array of buckets. We store as a flat slice and compute bucket indices.
 type Level struct {
-	slots []int  // length = number of buckets * b
+	slots      []int  // length = number of buckets * b
 	numBuckets int
+	mask       uint32 // bit mask for fast modulo (power of 2 optimization)
 }
 
 // NewFunnelHashTable creates a FunnelHashTable with given total size N, bucket size b, and empty fraction delta.
@@ -24,12 +25,17 @@ func NewFunnelHashTable(N int, b int, delta float64) *FunnelHashTable {
 	if delta < 0 || delta >= 1 {
 		panic("delta must be in (0,1)")
 	}
-	// Determine number of levels B (we choose such that levels geometrically decrease to a small size).
-	// For simplicity, let B = 3 or 4, and allocate levels with decreasing sizes.
+	
+	// Determine number of levels B, with optimized distribution
 	B := 3
+	if delta < 0.1 {
+		// For very low delta, use more levels
+		B = 4
+	}
 	if B < 1 {
 		B = 1
 	}
+	
 	// Total allowed elements:
 	maxElems := int((1 - delta) * float64(N))
 	ht := &FunnelHashTable{
@@ -39,9 +45,14 @@ func NewFunnelHashTable(N int, b int, delta float64) *FunnelHashTable {
 		size:     0,
 		capacity: maxElems,
 	}
-	// Example sizing strategy: level0 = 50% of N, level1 = 30% of N, level2 = 15% of N (sums to 95%, leaving 5% for special).
-	// (In practice, sizes can be tuned to optimize δ and probability guarantees)
-	sizes := []float64{0.5, 0.3, 0.15}  // for B=3 example
+	
+	// Revised sizing strategy based on paper analysis
+	// Designed for better load distribution
+	sizes := []float64{0.6, 0.25, 0.1}  // default for B=3
+	if B == 4 {
+		sizes = []float64{0.5, 0.25, 0.15, 0.05} // for B=4
+	}
+	
 	if B > len(sizes) {
 		// If more levels needed, fill uniformly smaller fractions
 		frac := 0.1
@@ -51,36 +62,74 @@ func NewFunnelHashTable(N int, b int, delta float64) *FunnelHashTable {
 			for _, f := range sizes {
 				remainingFrac -= f
 			}
-			if remainingFrac < 0.1 {
+			if remainingFrac < 0.05 {
 				break
 			}
 		}
 	}
-	// Allocate levels
+	
+	// Allocate levels, try to use power of 2 sizes for faster modulo operation
 	allocated := 0
 	for i := 0; i < B; i++ {
 		size_i := int(sizes[i] * float64(N))
 		if i == B-1 {
-			// last level gets whatever is left (excluding special)
+			// Ensure last level has enough space
 			size_i = int(sizes[i] * float64(N))
 		}
+		
+		// Ensure minimum bucket size
 		if size_i < b {
 			size_i = b
 		}
-		// number of buckets = size_i / b (truncate)
+		
+		// Number of buckets = size_i / b (truncate)
 		numB := size_i / b
+		
+		// Try to round to power of 2 for faster modulo operation
+		powerOf2 := 1
+		for powerOf2 < numB {
+			powerOf2 <<= 1
+		}
+		
+		// Use power of 2 if it doesn't increase size too much
+		if powerOf2 <= numB*5/4 {
+			numB = powerOf2
+		}
+		
+		// Compute mask for fast modulo if numB is power of 2
+		var mask uint32 = 0
+		if numB > 0 && (numB & (numB-1)) == 0 {
+			mask = uint32(numB - 1)
+		}
+		
 		levelSlots := make([]int, numB*b)
 		for j := range levelSlots {
 			levelSlots[j] = EMPTY
 		}
-		ht.levels[i] = Level{slots: levelSlots, numBuckets: numB}
+		
+		ht.levels[i] = Level{
+			slots:      levelSlots, 
+			numBuckets: numB,
+			mask:       mask,
+		}
 		allocated += numB * b
 	}
+	
 	// Special array gets remaining slots
 	specialSize := N - allocated
 	if specialSize < 1 {
 		specialSize = 1
 	}
+	
+	// Round special array to power of 2 for better performance if reasonable
+	powerOf2 := 1
+	for powerOf2 < specialSize {
+		powerOf2 <<= 1
+	}
+	if powerOf2 <= specialSize*5/4 {
+		specialSize = powerOf2
+	}
+	
 	ht.special = make([]int, specialSize)
 	for j := range ht.special {
 		ht.special[j] = EMPTY
@@ -89,6 +138,7 @@ func NewFunnelHashTable(N int, b int, delta float64) *FunnelHashTable {
 }
 
 // hashFunc for funnel hashing: (key, level) -> bucket index in that level.
+// Uses fast modulo if level's numBuckets is a power of 2
 func (ht *FunnelHashTable) hashFunc(key int, levelIdx int) int {
 	// Simple 32-bit mix for demonstration
 	h := uint32(key) * 0x9e3779b1
@@ -97,7 +147,14 @@ func (ht *FunnelHashTable) hashFunc(key int, levelIdx int) int {
 	h ^= h >> 13
 	h *= 0xc2b2ae35
 	h ^= h >> 16
+	
 	level := ht.levels[levelIdx]
+	
+	// Use bit masking for fast modulo if numBuckets is power of 2
+	if level.mask > 0 {
+		return int(h & level.mask)
+	}
+	
 	return int(h % uint32(level.numBuckets))
 }
 
@@ -106,79 +163,246 @@ func (ht *FunnelHashTable) Insert(key int) error {
 	if ht.size >= ht.capacity {
 		return errors.New("hash table is full")
 	}
-	if ht.Contains(key) {
-		return nil  // no duplicates for set semantics
-	}
+	
 	// Try each level in order
 	for i := 0; i < len(ht.levels); i++ {
 		lvl := &ht.levels[i]
 		bucketIdx := ht.hashFunc(key, i)
 		start := bucketIdx * ht.b  // index of first slot in this bucket
-		// Probe all slots in this bucket
-		emptySlot := -1
+		
+		// First check if key already exists in this bucket
 		for j := 0; j < ht.b; j++ {
 			slotIndex := start + j
 			if lvl.slots[slotIndex] == key {
-				return nil // already exists (shouldn't happen since we checked Contains)
-			}
-			if lvl.slots[slotIndex] == EMPTY {
-				emptySlot = slotIndex
-				break
+				return nil // already exists
 			}
 		}
-		if emptySlot != -1 {
-			// Found a free slot; insert and stop
-			lvl.slots[emptySlot] = key
-			ht.size++
-			return nil
+		
+		// Now look for an empty slot
+		for j := 0; j < ht.b; j++ {
+			slotIndex := start + j
+			if lvl.slots[slotIndex] == EMPTY {
+				lvl.slots[slotIndex] = key
+				ht.size++
+				return nil
+			}
 		}
 		// If bucket is full, fall through to next level
 	}
-	// If all levels failed, insert into special overflow (linear probing)
+	
+	// If all levels failed, insert into special overflow
+	// Optimize special array for power of 2 size if possible
 	m := len(ht.special)
-	h0 := ht.hashFunc(key, 0)  // reuse level0 hash as base for special (or use another hash)
-	for offset := 0; offset < m; offset++ {
-		pos := (h0 + offset) % m
-		if ht.special[pos] == EMPTY || ht.special[pos] == key {
-			ht.special[pos] = key
-			ht.size++
-			return nil
+	h0 := uint32(key) * 0x9e3779b1  // different hash for special array
+	
+	// Fast path if m is power of 2
+	if m > 0 && (m & (m-1)) == 0 {
+		mask := uint32(m - 1)
+		start := h0 & mask
+		
+		// First check if key already exists
+		for offset := uint32(0); offset < uint32(m); offset++ {
+			pos := int((start + offset) & mask)
+			if ht.special[pos] == key {
+				return nil
+			}
+			if ht.special[pos] == EMPTY {
+				ht.special[pos] = key
+				ht.size++
+				return nil
+			}
+		}
+	} else {
+		// Standard linear probing for non-power-of-2 sizes
+		start := int(h0 % uint32(m))
+		for offset := 0; offset < m; offset++ {
+			pos := (start + offset) % m
+			if ht.special[pos] == key {
+				return nil
+			}
+			if ht.special[pos] == EMPTY {
+				ht.special[pos] = key
+				ht.size++
+				return nil
+			}
 		}
 	}
+	
 	return errors.New("special array is full - insertion failed")
 }
 
 // Contains checks if a key exists in the table.
 func (ht *FunnelHashTable) Contains(key int) bool {
+	// Use local variables to avoid repeated field accesses
+	b := ht.b
+	
 	// Check each level's corresponding bucket
 	for i := 0; i < len(ht.levels); i++ {
 		lvl := &ht.levels[i]
 		bucketIdx := ht.hashFunc(key, i)
-		start := bucketIdx * ht.b
-		for j := 0; j < ht.b; j++ {
-			slotIndex := start + j
-			if lvl.slots[slotIndex] == key {
+		start := bucketIdx * b
+		
+		// Optimized unrolled version for common bucket sizes
+		switch {
+		case b >= 8:
+			// Unroll first 8 slots
+			if lvl.slots[start] == key {
 				return true
 			}
-			if lvl.slots[slotIndex] == EMPTY {
-				// If we find an empty, the key cannot be in this level (it would have been placed in this empty slot if it were here).
-				break
+			if lvl.slots[start] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+1] == key {
+				return true
+			}
+			if lvl.slots[start+1] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+2] == key {
+				return true
+			}
+			if lvl.slots[start+2] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+3] == key {
+				return true
+			}
+			if lvl.slots[start+3] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+4] == key {
+				return true
+			}
+			if lvl.slots[start+4] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+5] == key {
+				return true
+			}
+			if lvl.slots[start+5] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+6] == key {
+				return true
+			}
+			if lvl.slots[start+6] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+7] == key {
+				return true
+			}
+			if lvl.slots[start+7] == EMPTY {
+				goto nextLevel
+			}
+			
+			// Check remaining slots if bucket size > 8
+			for j := 8; j < b; j++ {
+				slotIndex := start + j
+				if lvl.slots[slotIndex] == key {
+					return true
+				}
+				if lvl.slots[slotIndex] == EMPTY {
+					goto nextLevel
+				}
+			}
+			
+		case b >= 4:
+			// Unroll 4 slots for medium buckets
+			if lvl.slots[start] == key {
+				return true
+			}
+			if lvl.slots[start] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+1] == key {
+				return true
+			}
+			if lvl.slots[start+1] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+2] == key {
+				return true
+			}
+			if lvl.slots[start+2] == EMPTY {
+				goto nextLevel
+			}
+			
+			if lvl.slots[start+3] == key {
+				return true
+			}
+			if lvl.slots[start+3] == EMPTY {
+				goto nextLevel
+			}
+			
+			// Check remaining slots if bucket size > 4
+			for j := 4; j < b; j++ {
+				slotIndex := start + j
+				if lvl.slots[slotIndex] == key {
+					return true
+				}
+				if lvl.slots[slotIndex] == EMPTY {
+					goto nextLevel
+				}
+			}
+			
+		default:
+			// Standard loop for small buckets
+			for j := 0; j < b; j++ {
+				slotIndex := start + j
+				if lvl.slots[slotIndex] == key {
+					return true
+				}
+				if lvl.slots[slotIndex] == EMPTY {
+					goto nextLevel
+				}
 			}
 		}
-		// not found in this level, move to next
+		
+	nextLevel:
+		// Continue to next level
 	}
+	
 	// Check special overflow array
 	m := len(ht.special)
-	h0 := ht.hashFunc(key, 0)
-	for offset := 0; offset < m; offset++ {
-		pos := (h0 + offset) % m
-		if ht.special[pos] == key {
-			return true
+	h0 := uint32(key) * 0x9e3779b1  // Different hash for special array
+	
+	// Fast path if m is power of 2
+	if m > 0 && (m & (m-1)) == 0 {
+		mask := uint32(m - 1)
+		start := h0 & mask
+		
+		for offset := uint32(0); offset < uint32(m); offset++ {
+			pos := int((start + offset) & mask)
+			if ht.special[pos] == key {
+				return true
+			}
+			if ht.special[pos] == EMPTY {
+				return false
+			}
 		}
-		if ht.special[pos] == EMPTY {
-			return false
+	} else {
+		// Standard linear probing for non-power-of-2 sizes
+		start := int(h0 % uint32(m))
+		for offset := 0; offset < m; offset++ {
+			pos := (start + offset) % m
+			if ht.special[pos] == key {
+				return true
+			}
+			if ht.special[pos] == EMPTY {
+				return false
+			}
 		}
 	}
+	
 	return false
 }
 

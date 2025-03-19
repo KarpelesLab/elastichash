@@ -80,21 +80,27 @@ func (ht *ElasticHashTable) Insert(key int) error {
 	if ht.size >= ht.capacity {
 		return errors.New("hash table is full (max load reached)")
 	}
-	// Check if already present to avoid duplicates (not strictly required by paper's model, but typical in set)
+	
+	// Check if key already exists in any level
 	if ht.Contains(key) {
 		return nil // already in table, nothing to do
 	}
+	
 	// Try each level in order
 	for i := 0; i < ht.L-1; i++ {
 		m := len(ht.levels[i])
 		// Generate up to R probe positions in Ai
-		tried := make(map[int]bool, ht.R)
+		// Use a fixed-size array instead of map for tracking tried positions
+		var tried [16]bool // Assuming R <= 16; adjust size if needed
 		for attempt := 0; attempt < ht.R; attempt++ {
 			pos := ht.hashFunc(key, i, attempt, m)
-			if tried[pos] {
+			if pos < len(tried) && tried[pos] {
 				continue // avoid duplicate probe (rare)
 			}
-			tried[pos] = true
+			if pos < len(tried) {
+				tried[pos] = true
+			}
+			
 			if ht.levels[i][pos] == EMPTY { // found an empty slot
 				ht.levels[i][pos] = key
 				ht.size++
@@ -103,6 +109,7 @@ func (ht *ElasticHashTable) Insert(key int) error {
 		}
 		// If we reach here, all R probes in A_i were occupied – move down to next level
 	}
+	
 	// Final level (A_{L-1}): do standard open addressing (linear probing for simplicity)
 	lastLevel := ht.L - 1
 	m := len(ht.levels[lastLevel])
@@ -116,6 +123,7 @@ func (ht *ElasticHashTable) Insert(key int) error {
 			return nil
 		}
 	}
+	
 	return errors.New("no empty slot found in final level (this should not happen under expected conditions)")
 }
 
@@ -124,13 +132,17 @@ func (ht *ElasticHashTable) Contains(key int) bool {
 	// Search through the same probe sequence used in insertion.
 	for i := 0; i < ht.L-1; i++ {
 		m := len(ht.levels[i])
-		tried := make(map[int]bool, ht.R)
+		// Use a fixed-size array instead of map for tracking tried positions
+		var tried [16]bool // Assuming R <= 16; adjust size if needed
 		for attempt := 0; attempt < ht.R; attempt++ {
 			pos := ht.hashFunc(key, i, attempt, m)
-			if tried[pos] {
+			if pos < len(tried) && tried[pos] {
 				continue
 			}
-			tried[pos] = true
+			if pos < len(tried) {
+				tried[pos] = true
+			}
+			
 			if ht.levels[i][pos] == key {
 				return true
 			}
@@ -143,6 +155,7 @@ func (ht *ElasticHashTable) Contains(key int) bool {
 		}
 		// not found in level i; continue to next level
 	}
+	
 	// Last level: do normal search (linear probe)
 	lastLevel := ht.L - 1
 	m := len(ht.levels[lastLevel])
