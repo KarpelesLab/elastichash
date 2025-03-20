@@ -71,6 +71,34 @@ func TestElasticHashTable(t *testing.T) {
 			}
 		}
 	}
+	
+	// Test Remove functionality
+	prevSize = eht.Size()
+	
+	// Remove an existing key
+	if !eht.Remove(0) {
+		t.Errorf("Failed to remove key 0 which should exist")
+	}
+	if eht.Size() != prevSize-1 {
+		t.Errorf("Size should decrease by 1 after removal, expected %d, got %d", prevSize-1, eht.Size())
+	}
+	if eht.Contains(0) {
+		t.Errorf("Key 0 should no longer be in the table after removal")
+	}
+	
+	// Remove a non-existing key
+	if eht.Remove(1000) {
+		t.Errorf("Removing non-existent key 1000 should return false")
+	}
+	
+	// Insert a key after removal
+	err = eht.Insert(0) // Previously removed
+	if err != nil {
+		t.Errorf("Error re-inserting key after removal: %v", err)
+	}
+	if !eht.Contains(0) {
+		t.Errorf("Key 0 should be in the table after re-insertion")
+	}
 }
 
 func TestFunnelHashTable(t *testing.T) {
@@ -138,6 +166,64 @@ func TestFunnelHashTable(t *testing.T) {
 				t.Errorf("Expected to find key %d after insertion", i)
 			}
 		}
+	}
+	
+	// Test Remove functionality
+	prevSize = fht.Size()
+	
+	// Remove an existing key
+	if !fht.Remove(0) {
+		t.Errorf("Failed to remove key 0 which should exist")
+	}
+	if fht.Size() != prevSize-1 {
+		t.Errorf("Size should decrease by 1 after removal, expected %d, got %d", prevSize-1, fht.Size())
+	}
+	if fht.Contains(0) {
+		t.Errorf("Key 0 should no longer be in the table after removal")
+	}
+	
+	// Remove a non-existing key
+	if fht.Remove(1000) {
+		t.Errorf("Removing non-existent key 1000 should return false")
+	}
+	
+	// Insert a key after removal
+	err = fht.Insert(0) // Previously removed
+	if err != nil {
+		t.Errorf("Error re-inserting key after removal: %v", err)
+	}
+	if !fht.Contains(0) {
+		t.Errorf("Key 0 should be in the table after re-insertion")
+	}
+	
+	// Test removal of a key in a different level
+	// First, we create a table with specific parameters to force a key into a certain level
+	smallTable := NewFunnelHashTable(20, 2, 0.1)
+	
+	// Insert several keys that will hash to the same bucket in level 0
+	smallTable.Insert(10)
+	smallTable.Insert(30) // Should go to the same bucket as 10
+	smallTable.Insert(50) // Should go to the same bucket as 10 and 30
+	smallTable.Insert(70) // Should be forced to level 1 (overflow)
+	
+	// Verify that all keys are present
+	if !smallTable.Contains(10) || !smallTable.Contains(30) || !smallTable.Contains(50) || !smallTable.Contains(70) {
+		t.Errorf("Test keys should be present before removal")
+	}
+	
+	// Remove the key from level 1
+	if !smallTable.Remove(70) {
+		t.Errorf("Failed to remove key 70 which should be in level 1")
+	}
+	
+	// Verify key is gone
+	if smallTable.Contains(70) {
+		t.Errorf("Key 70 should not be in the table after removal")
+	}
+	
+	// Other keys should still be present
+	if !smallTable.Contains(10) || !smallTable.Contains(30) || !smallTable.Contains(50) {
+		t.Errorf("Other keys should still be present after removal")
 	}
 }
 

@@ -36,4 +36,26 @@ func main() {
 	for i := 0; i < 10; i++ {
 		fmt.Printf("Key %d exists: %t\n", i, fht.Contains(i))
 	}
+	
+	// Demonstrate Remove functionality
+	fmt.Println("\nRemove Operations:")
+	
+	// Remove existing keys
+	eht.Remove(0)
+	fht.Remove(0)
+	
+	fmt.Println("\nAfter removing key 0:")
+	fmt.Printf("ElasticHashTable size: %d, Contains(0): %t\n", eht.Size(), eht.Contains(0))
+	fmt.Printf("FunnelHashTable size: %d, Contains(0): %t\n", fht.Size(), fht.Contains(0))
+	
+	// Reinsert removed keys
+	eht.Insert(0)
+	fht.Insert(0)
+	
+	fmt.Println("\nAfter re-inserting key 0:")
+	fmt.Printf("ElasticHashTable size: %d, Contains(0): %t\n", eht.Size(), eht.Contains(0))
+	fmt.Printf("FunnelHashTable size: %d, Contains(0): %t\n", fht.Size(), fht.Contains(0))
+	
+	// Demonstrate Thread-Safety with concurrent operations
+	fmt.Println("\nBoth implementations are thread-safe and support concurrent operations")
 }

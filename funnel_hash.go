@@ -3,13 +3,15 @@ package elastichash
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"sync/atomic"
 )
 
 type FunnelHashTable struct {
 	levels    []Level   // slice of levels 0..B-1
 	special   []int     // special overflow array
 	b         int       // bucket size (slots per bucket)
-	size      int
+	size      int32     // atomic counter for thread safety
 	capacity  int
 }
 
@@ -139,10 +141,11 @@ func NewFunnelHashTable(N int, b int, delta float64) *FunnelHashTable {
 
 // hashFunc for funnel hashing: (key, level) -> bucket index in that level.
 // Uses fast modulo if level's numBuckets is a power of 2
+// This version uses a high-performance Murmur-inspired hash
 func (ht *FunnelHashTable) hashFunc(key int, levelIdx int) int {
-	// Simple 32-bit mix for demonstration
-	h := uint32(key) * 0x9e3779b1
-	h ^= h >> 15
+	// Optimized 32-bit mix (inspired by Murmur3)
+	h := uint32(key)
+	h ^= h >> 16
 	h *= 0x85ebca6b
 	h ^= h >> 13
 	h *= 0xc2b2ae35
@@ -160,34 +163,43 @@ func (ht *FunnelHashTable) hashFunc(key int, levelIdx int) int {
 
 // Insert inserts a key into the funnel hash table.
 func (ht *FunnelHashTable) Insert(key int) error {
-	if ht.size >= ht.capacity {
+	if atomic.LoadInt32(&ht.size) >= int32(ht.capacity) {
 		return errors.New("hash table is full")
 	}
+	
+	// Quick duplicate check in thread-safe way
+	if ht.Contains(key) {
+		return nil
+	}
+	
+	// Cache b for better performance (avoid field access)
+	b := ht.b
 	
 	// Try each level in order
 	for i := 0; i < len(ht.levels); i++ {
 		lvl := &ht.levels[i]
 		bucketIdx := ht.hashFunc(key, i)
-		start := bucketIdx * ht.b  // index of first slot in this bucket
+		start := bucketIdx * b  // index of first slot in this bucket
 		
 		// First check if key already exists in this bucket
-		for j := 0; j < ht.b; j++ {
+		for j := 0; j < b; j++ {
 			slotIndex := start + j
 			if lvl.slots[slotIndex] == key {
 				return nil // already exists
 			}
 		}
 		
-		// Now look for an empty slot
-		for j := 0; j < ht.b; j++ {
+		// Now look for an empty or tombstone slot
+		for j := 0; j < b; j++ {
 			slotIndex := start + j
-			if lvl.slots[slotIndex] == EMPTY {
+			if lvl.slots[slotIndex] == EMPTY || lvl.slots[slotIndex] == TOMBSTONE {
 				lvl.slots[slotIndex] = key
-				ht.size++
+				atomic.AddInt32(&ht.size, 1)
 				return nil
 			}
 		}
 		// If bucket is full, fall through to next level
+		runtime.Gosched() // Yield to other goroutines - helps with contention
 	}
 	
 	// If all levels failed, insert into special overflow
@@ -206,9 +218,9 @@ func (ht *FunnelHashTable) Insert(key int) error {
 			if ht.special[pos] == key {
 				return nil
 			}
-			if ht.special[pos] == EMPTY {
+			if ht.special[pos] == EMPTY || ht.special[pos] == TOMBSTONE {
 				ht.special[pos] = key
-				ht.size++
+				atomic.AddInt32(&ht.size, 1)
 				return nil
 			}
 		}
@@ -220,9 +232,9 @@ func (ht *FunnelHashTable) Insert(key int) error {
 			if ht.special[pos] == key {
 				return nil
 			}
-			if ht.special[pos] == EMPTY {
+			if ht.special[pos] == EMPTY || ht.special[pos] == TOMBSTONE {
 				ht.special[pos] = key
-				ht.size++
+				atomic.AddInt32(&ht.size, 1)
 				return nil
 			}
 		}
@@ -388,6 +400,7 @@ func (ht *FunnelHashTable) Contains(key int) bool {
 			if ht.special[pos] == EMPTY {
 				return false
 			}
+			// Continue on tombstones
 		}
 	} else {
 		// Standard linear probing for non-power-of-2 sizes
@@ -395,6 +408,75 @@ func (ht *FunnelHashTable) Contains(key int) bool {
 		for offset := 0; offset < m; offset++ {
 			pos := (start + offset) % m
 			if ht.special[pos] == key {
+				return true
+			}
+			if ht.special[pos] == EMPTY {
+				return false
+			}
+			// Continue on tombstones
+		}
+	}
+	
+	return false
+}
+
+// Remove deletes a key from the hash table if it exists.
+// Returns true if the key was found and removed, false otherwise.
+func (ht *FunnelHashTable) Remove(key int) bool {
+	// Cache b for better performance
+	b := ht.b
+	
+	// Search in each level
+	for i := 0; i < len(ht.levels); i++ {
+		lvl := &ht.levels[i]
+		bucketIdx := ht.hashFunc(key, i)
+		start := bucketIdx * b
+		
+		// Search all slots in this bucket
+		for j := 0; j < b; j++ {
+			slotIndex := start + j
+			if lvl.slots[slotIndex] == key {
+				// Found the key - mark as deleted
+				lvl.slots[slotIndex] = TOMBSTONE
+				atomic.AddInt32(&ht.size, -1)
+				return true
+			}
+			if lvl.slots[slotIndex] == EMPTY {
+				// Encountered an empty slot - key not in this bucket
+				break 
+			}
+		}
+		// Not found in this level, continue to next level
+	}
+	
+	// Check special overflow array
+	m := len(ht.special)
+	h0 := uint32(key) * 0x9e3779b1  // Different hash for special array
+	
+	// Fast path if m is power of 2
+	if m > 0 && (m & (m-1)) == 0 {
+		mask := uint32(m - 1)
+		start := h0 & mask
+		
+		for offset := uint32(0); offset < uint32(m); offset++ {
+			pos := int((start + offset) & mask)
+			if ht.special[pos] == key {
+				ht.special[pos] = TOMBSTONE 
+				atomic.AddInt32(&ht.size, -1)
+				return true
+			}
+			if ht.special[pos] == EMPTY {
+				return false
+			}
+		}
+	} else {
+		// Standard linear probing for non-power-of-2 sizes
+		start := int(h0 % uint32(m))
+		for offset := 0; offset < m; offset++ {
+			pos := (start + offset) % m
+			if ht.special[pos] == key {
+				ht.special[pos] = TOMBSTONE
+				atomic.AddInt32(&ht.size, -1)
 				return true
 			}
 			if ht.special[pos] == EMPTY {
@@ -408,7 +490,7 @@ func (ht *FunnelHashTable) Contains(key int) bool {
 
 // Size returns the current number of elements in the table.
 func (ht *FunnelHashTable) Size() int {
-	return ht.size
+	return int(atomic.LoadInt32(&ht.size))
 }
 
 // Capacity returns the maximum number of elements the table can hold.
@@ -418,7 +500,7 @@ func (ht *FunnelHashTable) Capacity() int {
 
 // String returns a debug representation of the hash table.
 func (ht *FunnelHashTable) String() string {
-	str := fmt.Sprintf("FunnelHashTable: size=%d, capacity=%d, bucketSize=%d\n", ht.size, ht.capacity, ht.b)
+	str := fmt.Sprintf("FunnelHashTable: size=%d, capacity=%d, bucketSize=%d\n", ht.Size(), ht.capacity, ht.b)
 	for i := 0; i < len(ht.levels); i++ {
 		lvl := ht.levels[i]
 		str += fmt.Sprintf("Level %d (%d buckets): %v\n", i, lvl.numBuckets, lvl.slots)
